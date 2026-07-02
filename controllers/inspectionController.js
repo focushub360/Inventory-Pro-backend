@@ -2,9 +2,12 @@ const InspectionFormResponse = require('../models/InspectionFormResponse');
 const InspectionScanLog = require('../models/InspectionScanLog');
 const QRCode = require('../models/QRCode');
 const Product = require('../models/Product');
+const ProductItem = require('../models/ProductItem');
 const StageMovementLog = require('../models/StageMovementLog');
 const ProcessingStage = require('../models/ProcessingStage');
 const ProductStage = require('../models/ProductStage');
+const ManufacturingConfig = require('../models/ManufacturingConfig');
+const Role = require('../models/Role');
 const mongoose = require('mongoose');
 const {
   buildProductPayload,
@@ -12,6 +15,12 @@ const {
   getStageByNumber,
   resolveProductContext
 } = require('../services/inspectionService');
+const {
+  getInspectionClassification,
+  normalizeReportText,
+  reportIdFor,
+  toKey
+} = require('../utils/reportClassification');
 
 const todayRange = () => {
   const start = new Date();
@@ -32,6 +41,47 @@ const summarizeResponses = (responses = []) =>
     .map((item) => `${item.question || item.questionId}: ${Array.isArray(item.answer) ? item.answer.join(', ') : item.answer}`)
     .join('; ');
 const stageLabel = (stageNumber, stage) => stage?.stageName || `Stage ${stageNumber}`;
+
+const getProductWithCategoryForResponse = async (response, qrCode) => {
+  const codeCandidates = [
+    qrCode?.code,
+    response?.code,
+    response?.productId
+  ]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+  const productName = String(response?.productName || '').trim();
+
+  if (!codeCandidates.length && !productName) return null;
+
+  const directProduct = await Product.findOne({
+    $or: [
+      ...codeCandidates.map((code) => ({ code })),
+      ...(productName ? [{ productName }] : [])
+    ]
+  })
+    .populate('category', 'name')
+    .lean();
+  if (directProduct) return directProduct;
+
+  const item = await ProductItem.findOne({ code: { $in: codeCandidates } }).lean();
+  if (!item) return null;
+
+  if (item.rootProductId) {
+    const productById = await Product.findById(item.rootProductId)
+      .populate('category', 'name')
+      .lean();
+    if (productById) return productById;
+  }
+
+  if (item.rootCode) {
+    return Product.findOne({ code: item.rootCode })
+      .populate('category', 'name')
+      .lean();
+  }
+
+  return null;
+};
 
 const employeeIdMatch = (employeeId) => {
   const ids = [employeeId].filter(Boolean);
@@ -93,6 +143,46 @@ const canEmployeeProcessStage = (employee, stageNumber) => {
   return assignedStageNumbers.includes(Number(stageNumber));
 };
 
+const getEmployeeRolePermission = async (employee, productId) => {
+  if (employee?.role !== 'employee') return null;
+  if (!employee.assignedRole || !productId) return { allowed: false, stageNumbers: [] };
+
+  const role = await Role.findById(employee.assignedRole).lean();
+  if (!role) return { allowed: false, stageNumbers: [] };
+
+  const productIdString = String(productId);
+  const products = (role.permissions || []).flatMap((category) =>
+    category.subcategories?.length
+      ? category.subcategories.flatMap((subcategory) => subcategory.products || [])
+      : category.products || []
+  );
+  const permission = products.find((product) => String(product.productId) === productIdString);
+  if (!permission) return { allowed: false, stageNumbers: [] };
+
+  return {
+    allowed: true,
+    stageNumbers: (permission.stages || []).map((stage) => Number(stage.stageNumber)).filter(Number.isFinite)
+  };
+};
+
+const getEmployeeAssignedProductIds = async (employee) => {
+  if (employee?.role !== 'employee') return null;
+  if (!employee.assignedRole) return [];
+  const role = await Role.findById(employee.assignedRole).select('products permissions').lean();
+  if (!role) return [];
+
+  const productIds = new Set((role.products || []).map(String));
+  (role.permissions || []).forEach((category) => {
+    (category.subcategories || []).forEach((subcategory) => {
+      (subcategory.products || []).forEach((product) => {
+        if (product.productId) productIds.add(String(product.productId));
+      });
+    });
+  });
+
+  return Array.from(productIds);
+};
+
 const getCurrentQrForCodes = async (codes = []) => {
   const normalizedCodes = codes.filter(Boolean);
   if (!normalizedCodes.length) return null;
@@ -107,12 +197,6 @@ const getAvailableCountForStage = async (codes = [], stageNumber) => {
   const normalizedStageNumber = Number(stageNumber);
   if (!normalizedCodes.length || !Number.isFinite(normalizedStageNumber)) return 0;
 
-  const qrCount = await QRCode.countDocuments({
-    code: { $in: normalizedCodes },
-    currentStage: normalizedStageNumber
-  });
-  if (qrCount > 0) return qrCount;
-
   const productStages = await ProductStage.find({
     code: { $in: normalizedCodes },
     stageNumber: normalizedStageNumber
@@ -120,12 +204,20 @@ const getAvailableCountForStage = async (codes = [], stageNumber) => {
 
   const productStageCount = productStages.reduce((sum, row) => {
     const pending = Number(row.pendingCount);
-    if (Number.isFinite(pending) && pending > 0) return sum + pending;
+    if (Number.isFinite(pending)) return sum + Math.max(pending, 0);
     const available = Number(row.availableQuantity || 0);
-    const processed = Number(row.acceptedCount || 0) + Number(row.rejectedCount || 0) + Number(row.reworkCount || 0);
+    const processed = Number(row.acceptedCount || 0)
+      + Number(row.rejectedCount || 0)
+      + Number(row.reworkCount || 0);
     return sum + Math.max(available - processed, 0);
   }, 0);
-  if (productStageCount > 0) return productStageCount;
+  if (productStages.length) return productStageCount;
+
+  const qrCount = await QRCode.countDocuments({
+    code: { $in: normalizedCodes },
+    currentStage: normalizedStageNumber
+  });
+  if (qrCount > 0) return qrCount;
 
   const processingStages = await ProcessingStage.find({
     code: { $in: normalizedCodes },
@@ -135,23 +227,41 @@ const getAvailableCountForStage = async (codes = [], stageNumber) => {
 
   return processingStages.reduce((sum, row) => {
     const input = Number(row.inputQuantity || 0);
-    const processed = Number(row.acceptedQuantity || 0) + Number(row.rejectedQuantity || 0) + Number(row.reworkQuantity || 0);
+    const processed = Number(row.acceptedQuantity || 0)
+      + Number(row.rejectedQuantity || 0)
+      + Number(row.reworkQuantity || 0);
     return sum + Math.max(input - processed, 0);
   }, 0);
 };
 
-const buildEmployeeStageRows = async ({ codes = [], stages = [], employee }) => {
+const buildEmployeeStageRows = async ({ codes = [], stages = [], employee, productId, currentStageNumber }) => {
   const normalizedCodes = codes.filter(Boolean);
+  const rolePermission = await getEmployeeRolePermission(employee, productId);
   return Promise.all(
-    stages.map(async (stage) => ({
-      stageNumber: stage.stageNumber,
-      stageName: stage.stageName,
-      stageType: stage.stageType,
-      selectable: canEmployeeProcessStage(employee, stage.stageNumber),
-      availableCount: normalizedCodes.length
+    stages.map(async (stage) => {
+      const isCurrent = Number(stage.stageNumber) === Number(currentStageNumber);
+      const isAssigned = employee?.role !== 'employee'
+        || (rolePermission?.allowed && rolePermission.stageNumbers.includes(Number(stage.stageNumber)));
+      const availableCount = normalizedCodes.length
         ? await getAvailableCountForStage(normalizedCodes, stage.stageNumber)
-        : 0
-    }))
+        : 0;
+      const isOpenIntakeStage = Number(stage.stageNumber) === 1;
+      return {
+        stageNumber: stage.stageNumber,
+        stageName: stage.stageName,
+        productionLine: stage.productionLine || '',
+        reportType: stage.reportType || '',
+        processKey: stage.processKey || '',
+        processName: stage.processName || stage.stageName || '',
+        partKey: stage.partKey || '',
+        partName: stage.partName || '',
+        stageType: stage.stageType,
+        isCurrent,
+        isAssigned,
+        selectable: isAssigned && (isOpenIntakeStage || availableCount > 0),
+        availableCount
+      };
+    })
   );
 };
 
@@ -221,6 +331,10 @@ exports.getProductForEmployee = async (req, res) => {
     if (!qrCode) return res.status(404).json({ message: 'Product item not found' });
 
     const payload = await buildProductPayload(qrCode);
+    const rolePermission = await getEmployeeRolePermission(req.user, payload.product?._id);
+    if (req.user?.role === 'employee' && !rolePermission?.allowed) {
+      return res.status(403).json({ message: 'This product is not assigned to your role' });
+    }
     const access = validateEmployeeStageAccess({ employee: req.user, currentStage: payload.currentStage, stages: payload.stages });
 
     if (!access.allowed) {
@@ -270,28 +384,21 @@ exports.searchProductsForEmployee = async (req, res) => {
   try {
     const { q = '' } = req.query;
     const term = String(q).trim();
-    const assignedStageNumbers = req.user?.role === 'employee'
-      ? (
-          Array.isArray(req.user.assignedStages) && req.user.assignedStages.length
-            ? req.user.assignedStages.map((stage) => Number(stage.stageNumber || stage)).filter(Number.isFinite)
-            : [Number(req.user.manufacturingLevel || 1)]
-        )
-      : [];
-    const stageMatch = assignedStageNumbers.length
-      ? { currentStage: { $in: assignedStageNumbers } }
-      : {};
+    const assignedProductIds = await getEmployeeAssignedProductIds(req.user);
+    if (req.user?.role === 'employee' && assignedProductIds.length === 0) return res.json([]);
 
     // If employee searches by product name, we must return product-level entry
     // and show overall total QR count under that product.
+    const productFilter = assignedProductIds === null ? {} : { _id: { $in: assignedProductIds } };
     const productRows = await Product.find(
       term
-        ? {
+        ? { ...productFilter,
             $or: [
               { productName: { $regex: term, $options: 'i' } },
               { code: { $regex: term, $options: 'i' } }
             ]
           }
-        : {}
+        : productFilter
     )
       .limit(50)
       .lean();
@@ -314,7 +421,7 @@ exports.searchProductsForEmployee = async (req, res) => {
           .filter(Boolean);
 
         const latestQrRows = codes.length
-          ? await QRCode.find({ code: { $in: codes }, ...stageMatch }).sort({ updatedAt: -1 }).limit(1).lean()
+          ? await QRCode.find({ code: { $in: codes } }).sort({ updatedAt: -1 }).limit(1).lean()
           : null;
 
         const latestQr = latestQrRows?.[0];
@@ -325,10 +432,9 @@ exports.searchProductsForEmployee = async (req, res) => {
             count: await getAvailableCountForStage(codes, stage.stageNumber)
           }))
         );
-        const availableCount = assignedStageNumbers.length
-          ? stageCounts
-              .filter((item) => assignedStageNumbers.includes(item.stageNumber))
-              .reduce((sum, item) => sum + item.count, 0)
+        const permission = await getEmployeeRolePermission(req.user, matchedByProductName.find((p) => p.productName === productName)?._id);
+        const availableCount = permission?.stageNumbers?.length
+          ? stageCounts.filter((item) => permission.stageNumbers.includes(item.stageNumber)).reduce((sum, item) => sum + item.count, 0)
           : stageCounts.reduce((sum, item) => sum + item.count, 0);
         const firstAvailableStage = stageCounts.find((item) => item.count > 0);
 
@@ -369,8 +475,11 @@ exports.searchProductsForEmployee = async (req, res) => {
 exports.getBatchProductForEmployee = async (req, res) => {
   try {
     const { key } = req.params;
+    const assignedProductIds = await getEmployeeAssignedProductIds(req.user);
+    const productScope = assignedProductIds === null ? {} : { _id: { $in: assignedProductIds } };
 
     const productMatch = await Product.findOne({
+      ...productScope,
       $or: [
         { productName: key },
         {
@@ -385,19 +494,28 @@ exports.getBatchProductForEmployee = async (req, res) => {
 
     // If matched by productName, compute total QR count under that product name.
     if (productMatch?.productName) {
-      const matchedProducts = await Product.find({ productName: productMatch.productName }).select('code').lean();
+      const rolePermission = await getEmployeeRolePermission(req.user, productMatch._id);
+      if (req.user?.role === 'employee' && !rolePermission?.allowed) {
+        return res.status(403).json({ message: 'This product is not assigned to your role' });
+      }
+      const matchedProducts = await Product.find({ productName: productMatch.productName, ...productScope }).select('code').lean();
       const codes = matchedProducts.map((p) => p.code).filter(Boolean);
 
       const currentQr = await getCurrentQrForCodes(codes);
 
       const primaryCode = currentQr?.code || codes[0] || productMatch.code;
       const { config, stages } = await resolveProductContext(primaryCode);
-      const stageRows = await buildEmployeeStageRows({ codes, stages, employee: req.user });
-      const firstAvailableStage = stageRows.find((stage) => Number(stage.availableCount || 0) > 0);
+      const preliminaryStageRows = await buildEmployeeStageRows({ codes, stages, employee: req.user, productId: productMatch._id });
+      const firstAvailableStage = preliminaryStageRows.find((stage) => Number(stage.availableCount || 0) > 0);
       const currentStageNumber = currentQr?.currentStage > 0
         ? currentQr.currentStage
         : firstAvailableStage?.stageNumber || stages[0]?.stageNumber || 1;
       const currentStage = getStageByNumber(stages, currentStageNumber);
+      const stageRows = await buildEmployeeStageRows({ codes, stages, employee: req.user, productId: productMatch._id, currentStageNumber });
+
+      if (req.user?.role === 'employee' && !stageRows.some((stage) => stage.selectable)) {
+        return res.status(403).json({ message: `This product is currently at ${currentStage.stageName}, which is not assigned to your role` });
+      }
 
       const availableCount = await getAvailableCountForStage(codes, currentStageNumber);
 
@@ -426,6 +544,7 @@ exports.getBatchProductForEmployee = async (req, res) => {
           batchNo: '',
           partDescription: productMatch.description || productMatch.productName || '',
           availableCount,
+          createdDate: productMatch.createdAt || currentQr?.createdAt || null,
           currentStage: currentStage.stageName,
           currentStageNumber
         },
@@ -464,6 +583,10 @@ exports.getBatchProductForEmployee = async (req, res) => {
     const code = qrCode?.code || productMatch.code;
     const { product, config, stages } = await resolveProductContext(code);
     const resolvedProduct = product || productMatch;
+    const rolePermission = await getEmployeeRolePermission(req.user, resolvedProduct?._id);
+    if (req.user?.role === 'employee' && !rolePermission?.allowed) {
+      return res.status(403).json({ message: 'This product is not assigned to your role' });
+    }
     const currentStageNumber = qrCode?.currentStage > 0 ? qrCode.currentStage : stages[0]?.stageNumber || 1;
     const currentStage = getStageByNumber(stages, currentStageNumber);
     const availableCount = await getAvailableCountForStage([code], currentStageNumber) ||
@@ -497,11 +620,12 @@ exports.getBatchProductForEmployee = async (req, res) => {
         batchNo: qrCode?.batchNo || '',
         partDescription: resolvedProduct?.description || resolvedProduct?.productName || '',
         availableCount,
+        createdDate: resolvedProduct?.createdAt || qrCode?.createdAt || null,
         currentStage: currentStage.stageName,
         currentStageNumber
       },
       stage: currentStage,
-      stages: await buildEmployeeStageRows({ codes: [code], stages, employee: req.user }),
+      stages: await buildEmployeeStageRows({ codes: [code], stages, employee: req.user, productId: resolvedProduct?._id, currentStageNumber }),
       forms: (() => {
         const questions = currentStage?.reviewForm?.questions || currentStage?.reviewForm?.outcomes || [];
         return questions.length
@@ -530,6 +654,12 @@ exports.submitBatchInspectionResponse = async (req, res) => {
       code,
       batchNo = '',
       productName = '',
+      productionLine = '',
+      reportType = '',
+      processKey = '',
+      processName = '',
+      partKey = '',
+      partName = '',
       stageId,
       stageName = '',
       acceptedCount,
@@ -575,6 +705,7 @@ exports.submitBatchInspectionResponse = async (req, res) => {
       const selectedByQuestion = {};
       const countsByQuestionOption = {};
       const freeFormCountsByQuestion = {};
+      const missingReasonDetails = [];
 
       for (const r of responses || []) {
         const qKey = String(r?.questionId || r?.question || 'unknown');
@@ -585,11 +716,24 @@ exports.submitBatchInspectionResponse = async (req, res) => {
           if (!optionKey) continue;
           const countVal = Math.max(0, Number(r?.answer) || 0);
           if (optionKey === '__response__') {
+            if (countVal > 0 && !String(r?.defectDetail || r?.question || '').trim()) {
+              missingReasonDetails.push({
+                question: r?.question || qKey,
+                optionKey
+              });
+            }
             freeFormCountsByQuestion[qKey] = (freeFormCountsByQuestion[qKey] || 0) + countVal;
             continue;
           }
           if (!countsByQuestionOption[qKey]) countsByQuestionOption[qKey] = {};
-          countsByQuestionOption[qKey][optionKey] = countVal;
+          countsByQuestionOption[qKey][optionKey] = {
+            count: countVal,
+            defectDetail: String(r?.defectDetail || r?.defectType || r?.question || '').trim(),
+            assemblyProcess: String(r?.assemblyProcess || '').trim(),
+            defectType: String(r?.defectType || r?.defectDetail || r?.question || '').trim(),
+            subQuestion: String(r?.subQuestion || '').trim(),
+            subOption: String(r?.subOption || '').trim()
+          };
           continue;
         }
 
@@ -604,7 +748,14 @@ exports.submitBatchInspectionResponse = async (req, res) => {
         let qSum = 0;
         const countsForQ = countsByQuestionOption[qKey] || {};
         for (const opt of selectedSet) {
-          const c = Math.max(0, Number(countsForQ[opt]) || 0);
+          const countEntry = countsForQ[opt] || {};
+          const c = Math.max(0, Number(countEntry.count) || 0);
+          if (c > 0 && !countEntry.defectDetail) {
+            missingReasonDetails.push({
+              question: qKey,
+              optionKey: opt
+            });
+          }
           qSum += c;
         }
         overall += qSum;
@@ -617,7 +768,7 @@ exports.submitBatchInspectionResponse = async (req, res) => {
         perQuestion[qKey] = (perQuestion[qKey] || 0) + c;
       }
 
-      return { overall, perQuestion };
+      return { overall, perQuestion, missingReasonDetails };
     };
 
     const derivedRejected = deriveChoiceCountsFromResponses(rejectionFormResponses);
@@ -625,9 +776,16 @@ exports.submitBatchInspectionResponse = async (req, res) => {
 
     const counts = {
       accepted: toCount(acceptedCount),
-      rejected: derivedRejected.overall,
-      rework: derivedRework.overall
+      rejected: derivedRejected.overall || toCount(rejectedCount),
+      rework: derivedRework.overall || toCount(reworkCount)
     };
+
+    if (derivedRejected.missingReasonDetails.length) {
+      return res.status(400).json({ message: 'Enter a reject count for the selected reason details' });
+    }
+    if (derivedRework.missingReasonDetails.length) {
+      return res.status(400).json({ message: 'Enter a rework count for the selected reason details' });
+    }
 
     const total = counts.accepted + counts.rejected + counts.rework;
 
@@ -642,31 +800,36 @@ exports.submitBatchInspectionResponse = async (req, res) => {
       derivedReworkByQuestion: derivedRework.perQuestion
     });
     const qrCode = await QRCode.findOne({ code, ...(batchNo ? { batchNo } : {}) }).sort({ updatedAt: -1 });
-    const qrAvailableCount = qrCode?.quantity || await QRCode.countDocuments({ code, ...(batchNo ? { batchNo } : {}), currentStage: stageNumber });
-    const availableCount = qrAvailableCount || await getAvailableCountForStage([code], stageNumber);
-    if (total <= 0) return res.status(400).json({ message: 'Enter at least one processed item' });
-    if (total > availableCount) return res.status(400).json({ message: 'Quantity breakdown cannot exceed available item count' });
-    if ((counts.rejected > 0 || counts.rework > 0) && !String(remarks).trim()) {
-      return res.status(400).json({ message: 'Remarks are required when rejected or rework items are present' });
-    }
-
     const { product, stages } = await resolveProductContext(code);
+    const resolvedProductId = product?._id || productId;
+    const isOpenIntakeStage = Number(stageNumber) === 1;
+    const stageAvailableCount = await getAvailableCountForStage([code], stageNumber);
+    const hasStageQueue = await ProductStage.exists({ productId: resolvedProductId, stageNumber });
+    const availableCount = hasStageQueue ? stageAvailableCount : Number(qrCode?.quantity || 0);
+    if (total <= 0) return res.status(400).json({ message: 'Enter at least one processed item' });
+    if (!isOpenIntakeStage && total > availableCount) return res.status(400).json({ message: 'Quantity breakdown cannot exceed available item count' });
     const stage = getStageByNumber(stages, stageNumber);
+    const reportClassification = getInspectionClassification({
+      productionLine,
+      reportType,
+      processKey,
+      processName,
+      partKey,
+      partName,
+      productName: productName || product?.productName || code,
+      code,
+      partDescription: product?.description || product?.productName || '',
+      stageName: stageName || stage?.stageName || `Stage ${stageNumber}`
+    });
 
     // Update ProductStage counters based on submitted counts.
     // Keep QR logic only for trace/movement; ProductStage becomes source of truth for stage review stats.
     // NOTE: availableQuantity is expected to be initialized when ProductStage rows are created.
     // If not found, create it with sane defaults.
-    const ProductStage = require('../models/ProductStage');
-
-    const resolvedProductId = product?._id || productId;
-
-
     // Ensure ProductStage row exists for this product+stage
     const productStage = await ProductStage.findOneAndUpdate(
       {
         productId: resolvedProductId,
-        code,
         stageNumber
       },
       {
@@ -676,11 +839,11 @@ exports.submitBatchInspectionResponse = async (req, res) => {
           code,
           stageNumber,
           stageName: stage?.stageName || `Stage ${stageNumber}`,
-          availableQuantity: availableCount,
+          availableQuantity: isOpenIntakeStage ? 0 : availableCount,
           acceptedCount: 0,
           rejectedCount: 0,
           reworkCount: 0,
-          pendingCount: availableCount
+          pendingCount: isOpenIntakeStage ? 0 : availableCount
         }
       },
       { new: true, upsert: true }
@@ -690,7 +853,17 @@ exports.submitBatchInspectionResponse = async (req, res) => {
     const nextAccepted = Number(productStage.acceptedCount || 0) + counts.accepted;
     const nextRejected = Number(productStage.rejectedCount || 0) + counts.rejected;
     const nextRework = Number(productStage.reworkCount || 0) + counts.rework;
-    const nextPending = Math.max(Number(productStage.availableQuantity || availableCount || 0) - (nextAccepted + nextRejected + nextRework), 0);
+    // All submitted outcomes leave the active queue. Only accepted units move
+    // forward; rejected and rework remain recorded in logs and stage statistics.
+    const currentPending = Number.isFinite(Number(productStage.pendingCount))
+      ? Number(productStage.pendingCount)
+      : availableCount;
+    const nextPending = isOpenIntakeStage
+      ? 0
+      : Math.max(currentPending - total, 0);
+    const nextAvailableQuantity = isOpenIntakeStage
+      ? Number(productStage.availableQuantity || 0) + total
+      : Number(productStage.availableQuantity || availableCount || 0);
 
     await ProductStage.updateOne(
       {
@@ -701,6 +874,7 @@ exports.submitBatchInspectionResponse = async (req, res) => {
           acceptedCount: nextAccepted,
           rejectedCount: nextRejected,
           reworkCount: nextRework,
+          availableQuantity: nextAvailableQuantity,
           pendingCount: nextPending
         }
       }
@@ -717,7 +891,7 @@ exports.submitBatchInspectionResponse = async (req, res) => {
           code,
           stageNumber,
           stageName: stage?.stageName || `Stage ${stageNumber}`,
-          inputQuantity: Number(productStage.availableQuantity || availableCount || total || 0),
+          inputQuantity: nextAvailableQuantity,
           acceptedQuantity: nextAccepted,
           rejectedQuantity: nextRejected,
           reworkQuantity: nextRework,
@@ -741,6 +915,7 @@ exports.submitBatchInspectionResponse = async (req, res) => {
       code,
       batchNo,
       partDescription: product?.description || product?.productName || '',
+      ...reportClassification,
       stageNumber,
       stageName: stageName || stage?.stageName || `Stage ${stageNumber}`,
       status: counts.rejected > 0 ? 'REJECTED' : counts.rework > 0 ? 'REWORK' : 'ACCEPTED',
@@ -767,6 +942,7 @@ exports.submitBatchInspectionResponse = async (req, res) => {
       code,
       batchNo,
       partDescription: product?.description || product?.productName || '',
+      ...reportClassification,
       stageNumber,
       stageName: stageName || stage?.stageName || `Stage ${stageNumber}`,
       formId: `stage-${stageNumber}`,
@@ -794,13 +970,18 @@ exports.submitBatchInspectionResponse = async (req, res) => {
     const currentStageIndex = stages.findIndex((s) => Number(s.stageNumber) === Number(stageNumber));
     const nextStage = currentStageIndex >= 0 ? stages[currentStageIndex + 1] : null;
 
-    const qrsPool = await QRCode.find({
+    const candidateQrs = await QRCode.find({
       code,
       ...(batchNo ? { batchNo } : {}),
       currentStage: stageNumber
     })
-      .sort({ createdAt: 1 })
-      .limit(total);
+      .sort({ createdAt: 1 });
+
+    // ProductStage owns batch quantities. QR movement is only valid when the
+    // product really has one QR document per physical unit.
+    const hasUnitLevelQrs = candidateQrs.length >= total
+      && candidateQrs.slice(0, total).every((item) => Number(item.quantity || 1) === 1);
+    const qrsPool = hasUnitLevelQrs ? candidateQrs.slice(0, total) : [];
 
     const acceptedQrs = qrsPool.slice(0, counts.accepted);
     const rejectedQrs = qrsPool.slice(counts.accepted, counts.accepted + counts.rejected);
@@ -809,32 +990,32 @@ exports.submitBatchInspectionResponse = async (req, res) => {
     const operatorName = getEmployeeName(req.user);
 
     // Move accepted to next stage (if exists), else mark as accepted at current stage (final stage)
-    if (acceptedQrs.length && nextStage) {
-      // 1) Update QR codes to be processed at the next stage
-      await QRCode.updateMany(
-        { _id: { $in: acceptedQrs.map((q) => q._id) } },
-        { $set: { currentStage: nextStage.stageNumber, status: 'processing' } }
-      );
+    if (counts.accepted > 0 && nextStage) {
+      // Update unit-level QR codes when they exist. Batch quantities move via
+      // ProductStage below and must not move an entire aggregate QR document.
+      if (acceptedQrs.length) {
+        await QRCode.updateMany(
+          { _id: { $in: acceptedQrs.map((q) => q._id) } },
+          { $set: { currentStage: nextStage.stageNumber, status: 'processing' } }
+        );
+      }
 
       // 2) Queue counters: accepted items are now *arrived for processing* in next stage,
       // but they should not be counted as 'accepted' at the next stage yet.
       await ProductStage.findOneAndUpdate(
         {
           productId: resolvedProductId,
-          code,
           stageNumber: nextStage.stageNumber
         },
         {
           $setOnInsert: {
             productId: resolvedProductId,
             code,
-            stageNumber: nextStage.stageNumber,
-            stageName: nextStage.stageName || `Stage ${nextStage.stageNumber}`,
-            availableQuantity: 0,
+           stageNumber: nextStage.stageNumber,
+           stageName: nextStage.stageName || `Stage ${nextStage.stageNumber}`,
             acceptedCount: 0,
             rejectedCount: 0,
-            reworkCount: 0,
-            pendingCount: 0
+            reworkCount: 0
           },
           $inc: {
             availableQuantity: counts.accepted,
@@ -856,7 +1037,6 @@ exports.submitBatchInspectionResponse = async (req, res) => {
             code,
             stageNumber: nextStage.stageNumber,
             stageName: nextStage.stageName || `Stage ${nextStage.stageNumber}`,
-            inputQuantity: 0,
             outputQuantity: 0,
             acceptedQuantity: 0,
             rejectedQuantity: 0,
@@ -999,6 +1179,7 @@ exports.submitBatchInspectionResponse = async (req, res) => {
 
     res.status(201).json({ message: 'Batch inspection submitted', response: responseDoc });
   } catch (error) {
+    console.error('[inspection submitBatchInspectionResponse] Failed after submit:', error);
     res.status(500).json({ error: error.message });
   }
 };
@@ -1034,6 +1215,14 @@ exports.submitInspection = async (req, res) => {
     const { product, stages } = await resolveProductContext(qrCode.code);
     const currentStageNumber = qrCode.currentStage > 0 ? qrCode.currentStage : stages[0]?.stageNumber || 1;
     const currentStage = getStageByNumber(stages, currentStageNumber);
+    const reportClassification = getInspectionClassification({
+      ...currentStage,
+      productName: product?.productName || qrCode.code,
+      code: qrCode.code,
+      partDescription: product?.description || product?.productName || '',
+      stageName: currentStage.stageName,
+      formName
+    });
     const currentIndex = stages.findIndex((stage) => Number(stage.stageNumber) === Number(currentStage.stageNumber));
     const access = validateEmployeeStageAccess({ employee: req.user, currentStage, stages });
 
@@ -1130,6 +1319,7 @@ exports.submitInspection = async (req, res) => {
       code: qrCode.code,
       batchNo: qrCode.batchNo || '',
       partDescription: product?.description || product?.productName || '',
+      ...reportClassification,
       stageNumber: currentStage.stageNumber,
       stageName: currentStage.stageName,
       formId: formId || `stage-${currentStage.stageNumber}`,
@@ -1350,11 +1540,36 @@ exports.getScanLogs = async (req, res) => {
       })
     );
 
+    const detailMatch = {
+      ...employeeMatch,
+      ...(search
+        ? {
+            $or: [
+              { code: { $regex: search, $options: 'i' } },
+              { productName: { $regex: search, $options: 'i' } },
+              { partDescription: { $regex: search, $options: 'i' } },
+              { stageName: { $regex: search, $options: 'i' } }
+            ]
+          }
+        : {})
+    };
+    const detailRows = await InspectionFormResponse.find(detailMatch)
+      .sort({ submittedAt: 1, createdAt: 1 })
+      .lean();
+    const acceptedBeforeByStage = new Map();
+    const details = detailRows.map((item) => {
+      const key = `${item.code}::${item.stageNumber}`;
+      const previousAcceptedCount = acceptedBeforeByStage.get(key) || 0;
+      acceptedBeforeByStage.set(key, previousAcceptedCount + Number(item.acceptedCount || 0));
+      return { ...item, previousAcceptedCount };
+    }).reverse().slice(0, Number(limit) * 5);
+
 
     res.json({
       success: true,
       logs: rows,
       rows,
+      details,
       page: Number(page),
       limit: Number(limit)
     });
@@ -1409,10 +1624,16 @@ exports.getAdminResponses = async (req, res) => {
       const qrCode = response.qrCode
         ? await QRCode.findById(response.qrCode).lean()
         : await QRCode.findOne({ qrId: response.qrId }).lean();
+      const product = await getProductWithCategoryForResponse(response, qrCode);
+      const category = product?.category;
+      const categoryId = category?._id ? String(category._id) : '';
+      const categoryName = category?.name || '';
 
       if (!qrCode) {
         return {
           ...response,
+          categoryId,
+          categoryName,
           currentStageNumber: response.stageNumber,
           currentStageName: response.stageName
         };
@@ -1426,6 +1647,8 @@ exports.getAdminResponses = async (req, res) => {
 
       return {
         ...response,
+        categoryId,
+        categoryName,
         currentStageNumber,
         currentStageName: isCompleted ? 'Completed' : stageLabel(currentStageNumber, currentStage),
         itemStatus: qrCode.status || 'generated'
@@ -1541,5 +1764,567 @@ exports.getProductionAnalytics = async (req, res) => {
   }
 };
 
+exports.getRejectionReport = async (req, res) => {
+  try {
+    const now = new Date();
+    const month = Math.min(Math.max(Number(req.query.month) || now.getMonth() + 1, 1), 12);
+    const year = Number(req.query.year) || now.getFullYear();
+    const start = new Date(year, month - 1, 1);
+    const end = new Date(year, month, 1);
+    const daysInMonth = new Date(year, month, 0).getDate();
 
+    const responses = await InspectionFormResponse.find({
+      submittedAt: { $gte: start, $lt: end }
+    })
+      .select('acceptedCount rejectedCount reworkCount rejectionFormResponses submittedAt')
+      .lean();
 
+    const makeDayTotals = () =>
+      Array.from({ length: daysInMonth }, (_, index) => ({
+        day: index + 1,
+        output: 0,
+        rejection: 0,
+        rejectionPercent: 0
+      }));
+
+    const dayTotals = makeDayTotals();
+    const rowMap = new Map();
+    const totals = { output: 0, rejection: 0, rejectionPercent: 0 };
+
+    const ensureRow = (detail) => {
+      const key = String(detail || 'Unspecified rejection').trim() || 'Unspecified rejection';
+      if (!rowMap.has(key)) {
+        rowMap.set(key, {
+          defectGroup: 'Rejection',
+          rejectionDetails: key,
+          days: makeDayTotals(),
+          total: 0,
+          totalPercent: 0
+        });
+      }
+      return rowMap.get(key);
+    };
+
+    const getResponseCount = (answer) => {
+      if (answer?.type !== 'count') return 0;
+      return Math.max(0, Number(answer.answer) || 0);
+    };
+
+    for (const response of responses) {
+      const accepted = Math.max(0, Number(response.acceptedCount) || 0);
+      const rejected = Math.max(0, Number(response.rejectedCount) || 0);
+      const rework = Math.max(0, Number(response.reworkCount) || 0);
+      const output = accepted + rejected + rework;
+      const dayIndex = Math.max(0, Math.min(daysInMonth - 1, new Date(response.submittedAt).getDate() - 1));
+
+      dayTotals[dayIndex].output += output;
+      dayTotals[dayIndex].rejection += rejected;
+      totals.output += output;
+      totals.rejection += rejected;
+
+      const rejectionResponses = Array.isArray(response.rejectionFormResponses)
+        ? response.rejectionFormResponses
+        : [];
+
+      for (const answer of rejectionResponses) {
+        const count = getResponseCount(answer);
+        if (!count) continue;
+        const detail = answer.defectDetail || answer.optionKey || answer.question || 'Unspecified rejection';
+        const row = ensureRow(detail);
+        row.days[dayIndex].rejection += count;
+        row.total += count;
+      }
+    }
+
+    for (const day of dayTotals) {
+      day.rejectionPercent = day.output ? Number(((day.rejection / day.output) * 100).toFixed(2)) : 0;
+    }
+
+    totals.rejectionPercent = totals.output ? Number(((totals.rejection / totals.output) * 100).toFixed(2)) : 0;
+
+    const rows = Array.from(rowMap.values())
+      .map((row) => ({
+        ...row,
+        totalPercent: totals.rejection ? Number(((row.total / totals.rejection) * 100).toFixed(2)) : 0
+      }))
+      .sort((a, b) => b.total - a.total || a.rejectionDetails.localeCompare(b.rejectionDetails));
+
+    res.json({
+      month,
+      year,
+      days: dayTotals,
+      totals,
+      rows
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getMisDashboard = async (req, res) => {
+  try {
+    const now = new Date();
+    const month = Math.min(Math.max(Number(req.query.month) || now.getMonth() + 1, 1), 12);
+    const year = Number(req.query.year) || now.getFullYear();
+    const start = new Date(year, month - 1, 1);
+    const end = new Date(year, month, 1);
+    const daysInMonth = new Date(year, month, 0).getDate();
+
+    const responses = await InspectionFormResponse.find({
+      submittedAt: { $gte: start, $lt: end }
+    })
+      .select([
+        'productName', 'code', 'partDescription', 'productionLine', 'reportType',
+        'processKey', 'processName', 'partKey', 'partName', 'stageNumber', 'stageName', 'formName',
+        'acceptedCount', 'rejectedCount', 'reworkCount', 'responses',
+        'rejectionFormResponses', 'reworkFormResponses', 'submittedAt'
+      ].join(' '))
+      .lean();
+
+    const makeDays = () => Array.from({ length: daysInMonth }, (_, index) => ({
+      day: index + 1,
+      accepted: 0,
+      rejected: 0,
+      rework: 0,
+      output: 0,
+      rejection: 0,
+      rejectionAndRework: 0,
+      rejectionPercent: 0,
+      rejectionAndReworkPercent: 0
+    }));
+    const reports = {};
+    const productCodes = [...new Set(responses.map((response) => response.code).filter(Boolean))];
+    const productsByCode = new Map((await Product.find({ code: { $in: productCodes } })
+      .select('code productName category subcategory')
+      .populate('category', 'name')
+      .populate('subcategory', 'name category')
+      .lean()).map((product) => [product.code, product]));
+    const responseProductNames = [
+      ...new Set(responses.map((response) => response.productName).filter(Boolean))
+    ];
+    const configsByProductName = new Map((await ManufacturingConfig.find({
+      productName: { $in: responseProductNames }
+    }).lean()).map((config) => [normalizeReportText(config.productName), config]));
+
+    const ensureReport = (reportId, classification) => {
+      if (!reports[reportId]) {
+        reports[reportId] = {
+          reportId,
+          productionLine: classification.productionLine,
+          reportType: classification.reportType,
+          processKey: classification.processKey,
+          processName: classification.processName,
+          partKey: classification.partKey,
+          partName: classification.partName,
+          days: makeDays(),
+          totals: {
+            accepted: 0,
+            rejected: 0,
+            rework: 0,
+            output: 0,
+            rejection: 0,
+            rejectionAndRework: 0,
+            rejectionPercent: 0,
+            rejectionAndReworkPercent: 0
+          },
+          rows: {},
+          processRows: {}
+        };
+      }
+      return reports[reportId];
+    };
+
+    const resolveQuestionnaireLabels = (response, answer, type) => {
+      const config = configsByProductName.get(normalizeReportText(response?.productName));
+      const stage = (config?.stages || []).find((item) => Number(item.stageNumber) === Number(response?.stageNumber));
+      const formDefinition = type === 'rework'
+        ? stage?.reviewForm?.reworkForm
+        : stage?.reviewForm?.rejectionForm;
+      const questions = formDefinition?.questions || [];
+      const answerQuestionId = String(answer?.questionId || '').trim();
+      const answerOptionKey = String(answer?.optionKey || '').trim();
+
+      const findNestedQuestion = (rootQuestion, parentOption, nestedQuestions = [], path = []) => {
+        for (const nestedQuestion of nestedQuestions || []) {
+          const nestedQuestionText = String(nestedQuestion?.questionText || nestedQuestion?.label || nestedQuestion?.question || '').trim();
+          const nestedQuestionId = String(nestedQuestion?.questionId || nestedQuestion?.id || '').trim();
+          for (const nestedOption of nestedQuestion?.options || []) {
+            const nestedOptionLabel = String(nestedOption?.label || nestedOption?.value || '').trim();
+            const nestedOptionId = String(nestedOption?.optionId || nestedOption?.id || '').trim();
+            const nestedOptionMatches = answerOptionKey && [nestedOptionId, nestedOptionLabel].includes(answerOptionKey);
+            const nextPath = nestedQuestionText && (nestedOptionLabel || answerOptionKey)
+              ? [...path, { question: nestedQuestionText, option: nestedOptionLabel || answerOptionKey }]
+              : path;
+            if (nestedQuestionId === answerQuestionId && nestedOptionMatches) {
+              return {
+                rootQuestion,
+                parentOption,
+                subQuestion: nestedQuestionText,
+                subOption: nestedOptionLabel || answerOptionKey,
+                subQuestionPath: nextPath,
+                defectName: nestedOptionLabel || answerOptionKey,
+                hasSubQuestion: true
+              };
+            }
+            const deeperMatch = findNestedQuestion(rootQuestion, parentOption, nestedOption?.subQuestions || [], nextPath);
+            if (deeperMatch) {
+              return {
+                ...deeperMatch,
+                subQuestion: deeperMatch.subQuestion || nestedQuestionText,
+                subOption: deeperMatch.subOption || nestedOptionLabel || answerOptionKey,
+                subQuestionPath: deeperMatch.subQuestionPath?.length ? deeperMatch.subQuestionPath : nextPath
+              };
+            }
+          }
+          if (nestedQuestionId === answerQuestionId) {
+            const currentOption = String(answer?.subOption || '').trim();
+            return {
+              rootQuestion,
+              parentOption,
+              subQuestion: nestedQuestionText,
+              subOption: currentOption,
+              subQuestionPath: nestedQuestionText && currentOption ? [...path, { question: nestedQuestionText, option: currentOption }] : path,
+              defectName: String(answer?.defectDetail || answer?.defectType || nestedQuestionText).trim(),
+              hasSubQuestion: true
+            };
+          }
+        }
+        return null;
+      };
+
+      for (const question of questions) {
+        const rootQuestion = String(question?.questionText || question?.label || question?.question || '').trim();
+        for (const option of question?.options || []) {
+          const optionLabel = String(option?.label || option?.value || '').trim();
+          const optionId = String(option?.optionId || option?.id || '').trim();
+          const optionMatches = answerOptionKey && [optionId, optionLabel].includes(answerOptionKey);
+
+          if (String(question?.questionId || question?.id || '').trim() === answerQuestionId && optionMatches) {
+              return {
+                rootQuestion,
+                parentOption: optionLabel || answerOptionKey,
+                defectName: '',
+                hasSubQuestion: false
+              };
+          }
+
+          const nestedMatch = findNestedQuestion(rootQuestion, optionLabel || answer?.parentOption || answerOptionKey || 'Unspecified', option?.subQuestions || []);
+          if (nestedMatch) return nestedMatch;
+        }
+      }
+
+      return null;
+    };
+
+    const getCountAnswers = (answers = [], type, classification, response = {}) => (answers || [])
+      .filter((answer) => normalizeReportText(answer?.type) === 'count')
+      .map((answer) => {
+        const currentLabels = resolveQuestionnaireLabels(response, answer, type) || {};
+        const rootQuestion = String(currentLabels.rootQuestion || answer?.rootQuestion || answer?.question || (type === 'rework' ? 'Rework Reason' : 'Rejection Reason')).trim();
+        const parentOption = String(currentLabels.parentOption || answer?.parentOption || answer?.optionKey || 'Unspecified').trim();
+        const subQuestion = String(currentLabels.subQuestion || answer?.subQuestion || '').trim();
+        const subOption = String(currentLabels.subOption || answer?.subOption || '').trim();
+        const subQuestionPath = Array.isArray(currentLabels.subQuestionPath) && currentLabels.subQuestionPath.length
+          ? currentLabels.subQuestionPath
+          : subQuestion && subOption
+            ? [{ question: subQuestion, option: subOption }]
+            : [];
+        const defectName = String(currentLabels.defectName || answer?.defectDetail || answer?.defectType || answer?.question || 'Unspecified').trim();
+        const hasSubQuestion = currentLabels.hasSubQuestion ?? (
+          Boolean(answer?.rootQuestion || answer?.parentOption || answer?.subQuestion || answer?.subOption)
+          && normalizeReportText(answer?.defectDetail || answer?.defectType || answer?.question)
+            !== normalizeReportText(answer?.parentOption || answer?.optionKey)
+        );
+        const processName = String(answer?.assemblyProcess || classification.processName || '').trim();
+        const partName = String(response?.productName || response?.partName || classification.partName || '').trim();
+        return {
+          key: toKey(`${rootQuestion} ${parentOption} ${partName} ${subQuestion} ${subOption} ${defectName}`),
+          questionHeader: rootQuestion,
+          questionAnswer: parentOption,
+          subQuestion,
+          subOption,
+          subQuestionPath,
+          name: defectName,
+          hasSubQuestion,
+          processName,
+          partName,
+          count: toCount(answer?.answer)
+        };
+      })
+      .filter((answer) => answer.count > 0);
+
+    const addDefects = (report, answers, dayIndex) => {
+      for (const answer of answers) {
+        if (!report.rows[answer.key]) {
+          report.rows[answer.key] = {
+            defectCode: answer.key,
+            questionHeader: answer.questionHeader || '',
+            questionAnswer: answer.questionAnswer || '',
+            subQuestion: answer.subQuestion || '',
+            subOption: answer.subOption || '',
+            subQuestionPath: answer.subQuestionPath || [],
+            hasSubQuestion: Boolean(answer.hasSubQuestion),
+            defectName: answer.name,
+            assemblyProcess: answer.processName || '',
+            partName: answer.partName || '',
+            days: Array(daysInMonth).fill(0),
+            total: 0
+          };
+        }
+        report.rows[answer.key].days[dayIndex] += answer.count;
+        report.rows[answer.key].total += answer.count;
+      }
+    };
+
+    const addProcessOutput = (report, response, dayIndex, output, rejection) => {
+      const partName = String(response?.productName || response?.partName || report.partName || 'Unspecified').trim();
+      const processName = String(response?.processName || response?.stageName || report.processName || 'Unspecified').trim();
+      const key = toKey(`${partName} ${processName}`);
+      if (!report.processRows[key]) {
+        report.processRows[key] = {
+          key,
+          partName,
+          processName,
+          days: Array.from({ length: daysInMonth }, () => ({ output: 0, rejection: 0 })),
+          totalOutput: 0,
+          totalRejection: 0
+        };
+      }
+      report.processRows[key].days[dayIndex].output += output;
+      report.processRows[key].days[dayIndex].rejection += rejection;
+      report.processRows[key].totalOutput += output;
+      report.processRows[key].totalRejection += rejection;
+    };
+
+    for (const response of responses) {
+      const classification = getInspectionClassification(response);
+      const product = productsByCode.get(response.code);
+      const categoryId = product?.category?._id ? String(product.category._id) : '';
+      const subcategoryId = product?.subcategory?._id ? String(product.subcategory._id) : '';
+      const dynamicReportId = subcategoryId
+        ? `product-subcategory-${subcategoryId}`
+        : categoryId
+          ? `product-category-${categoryId}-all`
+          : '';
+      const primaryReportId = classification.productionLine && classification.reportType
+        ? reportIdFor(classification.productionLine, classification.reportType)
+        : '';
+      if (!primaryReportId && !dynamicReportId) continue;
+
+      const reportIds = [primaryReportId, dynamicReportId].filter(Boolean);
+      if (dynamicReportId) {
+        reportIds.push(`${dynamicReportId}-mis`);
+        reportIds.push(`${dynamicReportId}-crs`);
+        reportIds.push(`${dynamicReportId}-rejection`);
+        reportIds.push(`${dynamicReportId}-rework`);
+      }
+      if (classification.reportType === 'helmet-assembly') {
+        const line = normalizeReportText(classification.productionLine);
+        reportIds.push(`${line}-helmet-assembly-rejection`);
+        reportIds.push(`${line}-helmet-assembly-rework`);
+        reportIds.push(`stagewise-rejection-performance-${line}`);
+      }
+
+      const accepted = toCount(response.acceptedCount);
+      const rejected = toCount(response.rejectedCount);
+      const rework = toCount(response.reworkCount);
+      const output = accepted + rejected + rework;
+      const dayIndex = Math.max(0, Math.min(daysInMonth - 1, new Date(response.submittedAt).getDate() - 1));
+      const inspectionDefects = getCountAnswers(response.responses, 'reject', classification, response);
+      const rejectionDefects = getCountAnswers(response.rejectionFormResponses, 'reject', classification, response);
+      const reworkDefects = getCountAnswers(response.reworkFormResponses, 'rework', classification, response);
+
+      for (const reportId of reportIds) {
+        const report = ensureReport(reportId, classification);
+        const day = report.days[dayIndex];
+        day.accepted += accepted;
+        day.rejected += rejected;
+        day.rework += rework;
+        day.output += output;
+        day.rejection += rejected;
+        day.rejectionAndRework += rejected + rework;
+
+        report.totals.accepted += accepted;
+        report.totals.rejected += rejected;
+        report.totals.rework += rework;
+        report.totals.output += output;
+        report.totals.rejection += rejected;
+        report.totals.rejectionAndRework += rejected + rework;
+        addProcessOutput(report, response, dayIndex, output, rejected);
+
+        const isRejectionReport = reportId.endsWith('-helmet-assembly-rejection');
+        const isReworkReport = reportId.endsWith('-helmet-assembly-rework');
+        const isDynamicRejectionReport = reportId.endsWith('-rejection');
+        const isDynamicCrsReport = reportId.endsWith('-crs');
+        const isDynamicReworkReport = reportId.endsWith('-rework');
+        addDefects(
+          report,
+          isRejectionReport || isDynamicRejectionReport || isDynamicCrsReport
+            ? rejectionDefects
+            : isReworkReport || isDynamicReworkReport
+              ? reworkDefects
+              : [...inspectionDefects, ...rejectionDefects, ...reworkDefects],
+          dayIndex
+        );
+      }
+    }
+
+    for (const report of Object.values(reports)) {
+      for (const day of report.days) {
+        day.rejectionPercent = day.output ? Number(((day.rejection / day.output) * 100).toFixed(2)) : 0;
+        day.rejectionAndReworkPercent = day.output
+          ? Number(((day.rejectionAndRework / day.output) * 100).toFixed(2))
+          : 0;
+      }
+      report.totals.rejectionPercent = report.totals.output
+        ? Number(((report.totals.rejection / report.totals.output) * 100).toFixed(2))
+        : 0;
+      report.totals.rejectionAndReworkPercent = report.totals.output
+        ? Number(((report.totals.rejectionAndRework / report.totals.output) * 100).toFixed(2))
+        : 0;
+      report.rows = Object.values(report.rows).sort((a, b) =>
+        b.total - a.total || a.defectName.localeCompare(b.defectName)
+      );
+      report.processRows = Object.values(report.processRows).sort((a, b) =>
+        a.partName.localeCompare(b.partName) || a.processName.localeCompare(b.processName)
+      );
+    }
+
+    res.json({ month, year, daysInMonth, reports });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.backfillMisClassification = async (req, res) => {
+  try {
+    const query = {
+      $or: [
+        { productionLine: { $exists: false } },
+        { productionLine: '' },
+        { reportType: { $exists: false } },
+        { reportType: '' }
+      ]
+    };
+    const responses = await InspectionFormResponse.find(query)
+      .select('productName code partDescription stageName formName productionLine reportType processKey processName partKey partName')
+      .lean();
+
+    const operations = responses
+      .map((response) => ({
+        response,
+        classification: getInspectionClassification(response)
+      }))
+      .filter(({ classification }) => classification.productionLine && classification.reportType)
+      .map(({ response, classification }) => ({
+        updateOne: {
+          filter: { _id: response._id },
+          update: { $set: classification }
+        }
+      }));
+
+    if (operations.length) {
+      await InspectionFormResponse.bulkWrite(operations, { ordered: false });
+    }
+
+    res.json({
+      scanned: responses.length,
+      updated: operations.length,
+      skipped: responses.length - operations.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.syncMisTaxonomy = async (req, res) => {
+  try {
+    const configs = await ManufacturingConfig.find({});
+    let configsUpdated = 0;
+    let stagesUpdated = 0;
+    let stagesSkipped = 0;
+
+    for (const config of configs) {
+      let changed = false;
+      config.stages = config.stages.map((stage) => {
+        const classification = getInspectionClassification({
+          ...stage.toObject(),
+          productName: config.productName,
+          stageName: stage.stageName,
+          processName: stage.processName || stage.stageName,
+          partName: stage.partName || config.productName
+        });
+        if (!classification.productionLine || !classification.reportType) {
+          stagesSkipped += 1;
+          return stage;
+        }
+        const current = stage.toObject();
+        const differs = Object.entries(classification).some(([key, value]) => String(current[key] || '') !== String(value || ''));
+        if (!differs) return stage;
+        changed = true;
+        stagesUpdated += 1;
+        return { ...current, ...classification };
+      });
+      if (changed) {
+        await config.save();
+        configsUpdated += 1;
+      }
+    }
+
+    const responseQuery = {
+      $or: [
+        { productionLine: { $exists: false } },
+        { productionLine: '' },
+        { reportType: { $exists: false } },
+        { reportType: '' }
+      ]
+    };
+    const responses = await InspectionFormResponse.find(responseQuery)
+      .select('productName code partDescription stageName formName productionLine reportType processKey processName partKey partName')
+      .lean();
+    const responseOperations = responses
+      .map((response) => ({
+        response,
+        classification: getInspectionClassification(response)
+      }))
+      .filter(({ classification }) => classification.productionLine && classification.reportType)
+      .map(({ response, classification }) => ({
+        updateOne: {
+          filter: { _id: response._id },
+          update: { $set: classification }
+        }
+      }));
+    if (responseOperations.length) {
+      await InspectionFormResponse.bulkWrite(responseOperations, { ordered: false });
+    }
+
+    res.json({
+      configsScanned: configs.length,
+      configsUpdated,
+      stagesUpdated,
+      stagesSkipped,
+      responsesScanned: responses.length,
+      responsesUpdated: responseOperations.length,
+      responsesSkipped: responses.length - responseOperations.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getMisTaxonomy = async (req, res) => {
+  res.json({
+    productionLines: ['D1', 'D2', 'D3', 'D4'],
+    reportTypes: [
+      { value: 'helmet-assembly', label: 'Helmet Assembly' },
+      { value: 'visor-moulding', label: 'Visor Moulding' },
+      { value: 'visor-mechanism-top-moulding', label: 'Visor Mechanism Top Moulding' },
+      { value: 'visor-coating', label: 'Visor Coating' },
+      { value: 'shell-moulding', label: 'Shell Moulding' },
+      { value: 'chin-cover-moulding', label: 'Chin Cover Moulding' },
+      { value: 'spoiler-moulding', label: 'Spoiler Moulding' },
+      { value: 'stagewise-rejection', label: 'Stagewise Rejection' },
+      { value: 'bop-parts-receipt', label: 'BOP Parts Receipt' }
+    ]
+  });
+};

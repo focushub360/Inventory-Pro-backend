@@ -4,7 +4,15 @@ const inspectionAnswerSchema = new mongoose.Schema({
   questionId: String,
   question: String,
   type: String,
-  answer: mongoose.Schema.Types.Mixed
+  answer: mongoose.Schema.Types.Mixed,
+  optionKey: String,
+  rootQuestion: String,
+  parentOption: String,
+  subQuestion: String,
+  subOption: String,
+  defectDetail: String,
+  assemblyProcess: String,
+  defectType: String
 }, { _id: false });
 
 const inspectionFormResponseSchema = new mongoose.Schema({
@@ -18,6 +26,12 @@ const inspectionFormResponseSchema = new mongoose.Schema({
   code: { type: String, required: true, index: true },
   batchNo: { type: String, default: '' },
   partDescription: { type: String, default: '' },
+  productionLine: { type: String, default: '', index: true },
+  reportType: { type: String, default: '', index: true },
+  processKey: { type: String, default: '' },
+  processName: { type: String, default: '' },
+  partKey: { type: String, default: '' },
+  partName: { type: String, default: '' },
   stageNumber: { type: Number, required: true },
   stageName: { type: String, required: true },
   formId: { type: String, default: '' },
@@ -51,7 +65,6 @@ const inspectionFormResponseSchema = new mongoose.Schema({
 inspectionFormResponseSchema.index({ code: 1, submittedAt: -1 });
 inspectionFormResponseSchema.index({ employee: 1, submittedAt: -1 });
 inspectionFormResponseSchema.index({ stageNumber: 1, inspectionResult: 1 });
+inspectionFormResponseSchema.index({ productionLine: 1, reportType: 1, submittedAt: -1 });
 
 module.exports = mongoose.model('InspectionFormResponse', inspectionFormResponseSchema);
-
-

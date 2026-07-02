@@ -28,6 +28,8 @@ const stageReviewConfigRoutes = require("./routes/stageReviewConfigRoutes");
 const inspectionRoutes = require('./routes/inspection');
 const formRoutes = require('./routes/forms');
 const defectDetailRoutes = require('./routes/defectDetails');
+const roleRoutes = require('./routes/roles');
+const misOperationsRoutes = require('./routes/misOperations');
 
 
 
@@ -36,7 +38,7 @@ const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI;
 
 // Middleware
-const allowedOrigins = ['https://inventory-pro-frontend-delta.vercel.app', 'http://localhost:3000'];
+const allowedOrigins = ['https://inventory-management-frontend-rosy.vercel.app', 'http://localhost:3000' , 'https://inventory-pro-fe.vercel.app/login'];
 app.use(cors({
   origin: function (origin, callback) {
     if (!origin) return callback(null, true);
@@ -80,6 +82,8 @@ app.use("/api/stage-review-config", stageReviewConfigRoutes);
 app.use('/api/inspection', inspectionRoutes);
 app.use('/api/forms', formRoutes);
 app.use('/api/defect-details', defectDetailRoutes);
+app.use('/api/roles', roleRoutes);
+app.use('/api/mis-operations', misOperationsRoutes);
 
 app.get('/', (req, res) => {
   res.send('Welcome to the Inventory and Billing System API - Backend Running Successfully!');
@@ -131,4 +135,3 @@ const startServer = async () => {
 startServer();
 
 module.exports = app;
-

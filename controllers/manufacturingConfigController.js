@@ -1,5 +1,6 @@
 const ManufacturingConfig = require('../models/ManufacturingConfig');
 const Product = require('../models/Product');
+const { getInspectionClassification } = require('../utils/reportClassification');
 
 const getWorkflowType = (stages = []) => `${Math.max(stages.length, 1)}-step`;
 const defaultStages = [
@@ -11,17 +12,54 @@ const defaultStages = [
   }
 ];
 
-const normalizeStages = (stages) => {
-  const sourceStages = Array.isArray(stages) && stages.length > 0 ? stages : defaultStages;
+const productContextFromProduct = (product) => {
+  const categoryName = product?.category?.name || '';
+  const subcategoryName = product?.subcategory?.name || '';
 
-  return sourceStages.map((stage, index) => ({
-    stageNumber: index + 1,
-    stageName: String(stage.stageName || `Stage ${index + 1}`).trim(),
-    stageType: index === 0 ? 'manufacturing' : (stage.stageType || 'processing'),
-    description: stage.description,
-    requiresValidation: Boolean(stage.requiresValidation),
-    reviewForm: stage.reviewForm || { outcomes: [] }
-  }));
+  return {
+    productName: product?.productName || product?.description || '',
+    categoryName,
+    subcategoryName,
+    processName: [categoryName, subcategoryName].filter(Boolean).join(' - '),
+    productionLine: getInspectionClassification({
+      productName: subcategoryName || product?.productName,
+      stageName: subcategoryName
+    }).productionLine,
+    reportType: getInspectionClassification({
+      productName: categoryName,
+      stageName: categoryName
+    }).reportType
+  };
+};
+
+const normalizeStages = (stages, productContext = {}) => {
+  const sourceStages = Array.isArray(stages) && stages.length > 0 ? stages : defaultStages;
+  const productName = productContext.productName || '';
+  const processName = productContext.processName
+    || [productContext.categoryName, productContext.subcategoryName].filter(Boolean).join(' - ');
+
+  return sourceStages.map((stage, index) => {
+    const stageName = String(stage.stageName || `Stage ${index + 1}`).trim();
+    const classification = getInspectionClassification({
+      ...stage,
+      productionLine: productContext.productionLine || stage.productionLine,
+      reportType: productContext.reportType || stage.reportType,
+      productName,
+      partDescription: productContext.categoryName,
+      stageName,
+      processName,
+      partName: productName
+    });
+    return {
+      stageNumber: index + 1,
+      stageName,
+      stageType: index === 0 ? 'manufacturing' : (stage.stageType || 'processing'),
+      description: stage.description,
+      requiresValidation: Boolean(stage.requiresValidation),
+      ...classification,
+      reviewForm: stage.reviewForm || { outcomes: [] }
+    };
+  });
 };
 
 const sendSaveError = (res, error) => {
@@ -107,7 +145,9 @@ exports.createManufacturingConfig = async (req, res) => {
       return res.status(400).json({ message: 'productName is required' });
     }
 
-    const product = await Product.findOne({ productName });
+    const product = await Product.findOne({ productName })
+      .populate('category', 'name')
+      .populate('subcategory', 'name');
     if (!product) {
       return res.status(404).json({ message: 'Product not found for given productName' });
     }
@@ -117,7 +157,7 @@ exports.createManufacturingConfig = async (req, res) => {
       return res.status(400).json({ message: 'Configuration already exists for this productName' });
     }
 
-    const normalizedStages = normalizeStages(stages);
+    const normalizedStages = normalizeStages(stages, productContextFromProduct(product));
 
     const config = new ManufacturingConfig({
       productName: productName || product.productName || product.description,
@@ -140,12 +180,16 @@ exports.updateManufacturingConfig = async (req, res) => {
     }
 
     const { productName, workflowType, stages, isActive } = req.body;
+    let productContext = null;
 
     if (productName !== undefined && productName !== config.productName) {
-      const product = await Product.findOne({ productName });
+      const product = await Product.findOne({ productName })
+        .populate('category', 'name')
+        .populate('subcategory', 'name');
       if (!product) {
         return res.status(404).json({ message: 'Product not found for given productName' });
       }
+      productContext = productContextFromProduct(product);
 
       const existingConfig = await ManufacturingConfig.findOne({
         productName,
@@ -159,7 +203,13 @@ exports.updateManufacturingConfig = async (req, res) => {
     }
 
     if (stages) {
-      const normalizedStages = normalizeStages(stages);
+      if (!productContext) {
+        const product = await Product.findOne({ productName: productName || config.productName })
+          .populate('category', 'name')
+          .populate('subcategory', 'name');
+        productContext = product ? productContextFromProduct(product) : { productName: productName || config.productName };
+      }
+      const normalizedStages = normalizeStages(stages, productContext);
       config.stages = normalizedStages;
       config.workflowType = getWorkflowType(normalizedStages);
     } else if (workflowType) {
@@ -202,6 +252,12 @@ exports.getReviewForms = async (req, res) => {
         stageNumber: s.stageNumber,
         stageName: s.stageName,
         stageType: s.stageType,
+        productionLine: s.productionLine || '',
+        reportType: s.reportType || '',
+        processKey: s.processKey || '',
+        processName: s.processName || '',
+        partKey: s.partKey || '',
+        partName: s.partName || '',
         reviewForm: s.reviewForm || { outcomes: [] }
       }))
     });
@@ -287,6 +343,3 @@ exports.validateStageSequence = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
-
-
-
